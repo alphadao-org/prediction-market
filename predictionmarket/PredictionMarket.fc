@@ -1,0 +1,317 @@
+#include "stdlib.fc";
+
+int equal_slices(slice s1, slice s2) asm "SDEQ";
+
+;; Helper to convert address to bits
+(int) addr_to_bits(slice addr) inline {
+    return slice_hash(addr);
+}
+
+;; Check if sender is main admin or sub-admin
+(int) is_authorized(slice sender, slice main_admin, cell sub_admins) inline {
+    if (equal_slices(sender, main_admin)) {
+        return 1;
+    }
+    if (~ sub_admins.dict_empty?()) {
+        int key = addr_to_bits(sender);
+        var (slice value, int found) = udict_get?(sub_admins, 256, addr_to_bits(sender));
+        return found;
+    }
+    return 0;
+}
+
+;; Add new sub-admin to dictionary
+(cell, int) add_sub_admin(cell sub_admins, int count, slice new_sub_admin) inline {
+    var addr_bits = addr_to_bits(new_sub_admin);
+   var new_sub_admins = udict_set_ref(sub_admins, 256, addr_bits, begin_cell().store_slice(new_sub_admin).end_cell());
+    return (new_sub_admins, count + 1);
+}
+
+;; Storage: [admin_address:slice, sub_admin_count:int, sub_admins:cell, market_count:int, markets:cell, predictions:cell, fees:int]
+() recv_internal(int msg_value, cell in_msg, slice in_msg_body) impure {
+    ;; Parse sender
+    slice sender = in_msg_body~load_msg_addr();
+    
+    ;; Parse storage
+    slice ds = get_data().begin_parse();
+    slice admin_address = ds~load_msg_addr();
+    int sub_admin_count = ds~load_uint(8);    ;; Sub-admin count (0-3)
+    cell sub_admins = ds~load_ref();          ;; Sub-admins dictionary
+    int market_count = ds~load_uint(32);
+    cell markets_dict = ds~load_dict();
+    cell predictions_dict = ds~load_dict();
+    int fees = ds~load_uint(64);
+    
+    ;; Check authorization for admin-only operations
+    int is_auth = is_authorized(sender, admin_address, sub_admins);
+    
+    ;; Message types (opcodes)
+    int op = in_msg_body~load_uint(32);
+    
+    ;; Create market (admin or sub-admin)
+    if (op == 0x01) {
+        throw_unless(101, is_auth);  ;; Check if sender is authorized
+        int market_id = market_count + 1;
+        cell question = in_msg_body~load_ref();
+        int start_time = in_msg_body~load_uint(32);
+        int close_time = in_msg_body~load_uint(32);
+        
+        ;; Store market: { id: { question:cell, start_time, close_time, yes_pool, no_pool, outcome } }
+        var market = begin_cell()
+            .store_ref(question)
+            .store_uint(start_time, 32)
+            .store_uint(close_time, 32)
+            .store_uint(0, 64) ;; yes_pool
+            .store_uint(0, 64) ;; no_pool
+            .store_uint(0, 2)  ;; outcome (0: unset, 1: Yes, 2: No)
+            .end_cell();
+        markets_dict = udict_set_ref(markets_dict, 32, market_id, market);
+        
+        ;; Update storage
+        var new_ds = begin_cell()
+            .store_slice(admin_address)
+            .store_uint(sub_admin_count, 8)
+            .store_ref(sub_admins)
+            .store_uint(market_id, 32)
+            .store_dict(markets_dict)
+            .store_dict(predictions_dict)
+            .store_uint(fees, 64)
+            .end_cell();
+        set_data(new_ds);
+    }
+    
+    ;; Predict (Yes/No)
+    if (op == 0x02) {
+        int market_id = in_msg_body~load_uint(32);
+        int choice = in_msg_body~load_uint(1); ;; 1: Yes, 0: No
+        int amount = msg_value;
+        
+        ;; Load market
+        (slice market_slice, int found) = udict_get?(markets_dict, 32, market_id);
+        throw_unless(102, found);
+        var market = market_slice;
+        cell question = market~load_ref();
+        int start_time = market~load_uint(32);
+        int close_time = market~load_uint(32);
+        int now = now();
+        throw_unless(103, now >= start_time ? now <= close_time : 0);
+        
+        ;; Update pool
+        int yes_pool = market~load_uint(64);
+        int no_pool = market~load_uint(64);
+        if (choice == 1) {
+            yes_pool += amount;
+        } else {
+            no_pool += amount;
+        }
+        
+        ;; Update market
+        var new_market = begin_cell()
+            .store_ref(question)
+            .store_uint(start_time, 32)
+            .store_uint(close_time, 32)
+           .store_uint(yes_pool, 64)
+            .store_uint(no_pool, 64)
+            .store_uint(market~load_uint(2), 2)
+            .end_cell();
+        markets_dict = udict_set_ref(markets_dict, 32, market_id, new_market);
+        
+        ;; Store prediction
+        var user_pred = begin_cell()
+            .store_uint(choice, 1)
+            .store_uint(amount, 64)
+            .end_cell();
+        slice key_slice = begin_cell()
+            .store_uint(market_id, 32)
+            .store_slice(sender)
+            .end_cell()
+            .begin_parse();
+        predictions_dict = udict_set_ref(predictions_dict, 256, slice_hash(key_slice), user_pred);
+        
+        ;; Update storage
+        var new_ds = begin_cell()
+            .store_slice(admin_address)
+            .store_uint(sub_admin_count, 8)
+            .store_ref(sub_admins)
+            .store_uint(market_count, 32)
+            .store_dict(markets_dict)
+            .store_dict(predictions_dict)
+            .store_uint(fees, 64)
+            .end_cell();
+        set_data(new_ds);
+    }
+    
+    ;; Set outcome (admin or sub-admin)
+    if (op == 0x03) {
+        throw_unless(104, is_auth);  ;; Check if sender is authorized
+        int market_id = in_msg_body~load_uint(32);
+        int outcome = in_msg_body~load_uint(2);
+        ;; Update market outcome
+        (slice market_slice, int found) = udict_get?(markets_dict, 32, market_id);
+        throw_unless(105, found);
+        var market = market_slice;
+        cell question = market~load_ref();
+        int start_time = market~load_uint(32);
+        int close_time = market~load_uint(32);
+        throw_unless(106, now() > close_time);
+        
+        var new_market = begin_cell()
+            .store_ref(question)
+            .store_uint(start_time, 32)
+            .store_uint(close_time, 32)
+            .store_uint(market~load_uint(64), 64)
+            .store_uint(market~load_uint(64), 64)
+            .store_uint(outcome, 2)
+            .end_cell();
+        markets_dict = udict_set_ref(markets_dict, 32, market_id, new_market);
+        
+        ;; Update storage
+        var new_ds = begin_cell()
+            .store_slice(admin_address)
+            .store_uint(sub_admin_count, 8)
+            .store_ref(sub_admins)
+            .store_uint(market_count, 32)
+            .store_dict(markets_dict)
+            .store_dict(predictions_dict)
+            .store_uint(fees, 64)
+            .end_cell();
+        set_data(new_ds);
+    }
+    
+    ;; Withdraw winnings
+    if (op == 0x04) {
+        int market_id = in_msg_body~load_uint(32);
+        (slice market_slice, int found) = udict_get?(markets_dict, 32, market_id);
+        throw_unless(107, found);
+        var market = market_slice;
+        cell question = market~load_ref();
+        int start_time = market~load_uint(32);
+        int close_time = market~load_uint(32);
+        int yes_pool = market~load_uint(64);
+        int no_pool = market~load_uint(64);
+        int outcome = market~load_uint(2);
+        throw_unless(108, outcome != 0);
+        
+        (slice user_pred_slice, int pred_found) = udict_get?(predictions_dict, 256, slice_hash(begin_cell().store_uint(market_id, 32).store_slice(sender).end_cell().begin_parse()));
+        throw_unless(109, pred_found);
+        var pred = user_pred_slice;
+        int choice = pred~load_uint(1);
+        int amount = pred~load_uint(64);
+        throw_unless(110, choice == outcome);
+        
+        ;; Calculate payout (5% fee)
+        int total_winning_pool = outcome == 1 ? yes_pool : no_pool;
+        int total_losing_pool = outcome == 1 ? no_pool : yes_pool;
+        throw_unless(112, total_winning_pool > 0); ;; Zero-division check
+        int fee = (total_losing_pool * 5) / 100;
+        int payout_pool = total_losing_pool - fee;
+        int user_share = (amount * payout_pool) / total_winning_pool;
+        int user_fee = (user_share * 5) / 100;
+        int final_payout = user_share - user_fee;
+        
+        ;; Update fees
+        fees += fee + user_fee;
+        
+        ;; Update storage
+        var new_ds = begin_cell()
+        .store_slice(admin_address)
+            .store_uint(sub_admin_count, 8)
+            .store_ref(sub_admins)
+            .store_uint(market_count, 32)
+            .store_dict(markets_dict)
+            .store_dict(predictions_dict)
+            .store_uint(fees, 64)
+            .end_cell();
+        set_data(new_ds);
+        
+        ;; Send payout
+        send_raw_message(
+            begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(sender)
+                .store_grams(final_payout)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32)
+                .end_cell(),
+            0
+        );
+    }
+    
+    ;; Collect fees (admin or sub-admin)
+    if (op == 0x05) {
+        throw_unless(111, is_auth);  ;; Check if sender is authorized
+        var new_ds = begin_cell()
+            .store_slice(admin_address)
+            .store_uint(sub_admin_count, 8)
+            .store_ref(sub_admins)
+            .store_uint(market_count, 32)
+            .store_dict(markets_dict)
+            .store_dict(predictions_dict)
+            .store_uint(0, 64)
+            .end_cell();
+        set_data(new_ds);
+        
+        send_raw_message(
+            begin_cell()
+                .store_uint(0x18, 6)
+                .store_slice(admin_address)
+                .store_grams(fees)
+                .store_uint(0, 1 + 4 + 4 + 64 + 32)
+                .end_cell(),
+            0
+        );
+    }
+    
+    ;; Add sub-admin (main admin only, new opcode)
+    if (op == 0x06) {
+        throw_unless(113, equal_slices(sender, admin_address));  ;; Only main admin
+        throw_unless(114, sub_admin_count < 3);  ;; Max 3 sub-admins
+        
+        slice new_sub_admin = in_msg_body~load_msg_addr();
+        var (new_sub_admins, new_count) = add_sub_admin(sub_admins, sub_admin_count, new_sub_admin);
+        
+        ;; Update storage
+        var new_ds = begin_cell()
+            .store_slice(admin_address)
+            .store_uint(new_count, 8)
+            .store_ref(new_sub_admins)
+            .store_uint(market_count, 32)
+            .store_dict(markets_dict)
+            .store_dict(predictions_dict)
+            .store_uint(fees, 64)
+            .end_cell();
+        set_data(new_ds);
+    }
+}
+
+;; Modified getter to include sub-admin data
+(slice, int, cell, int, cell, cell, int) get_contract_data() method_id {
+    slice ds = get_data().begin_parse();
+    slice admin_address = ds~load_msg_addr();
+    int sub_admin_count = ds~load_uint(8);
+    cell sub_admins = ds~load_ref();
+    int market_count = ds~load_uint(32);
+    cell markets_dict = ds~load_dict();
+    cell predictions_dict = ds~load_dict();
+    int fees = ds~load_uint(64);
+    return (admin_address, sub_admin_count, sub_admins, market_count, markets_dict, predictions_dict, fees);
+}
+
+;; Fixed market getter
+(cell, int, int, int, int, int) get_market(int market_id) method_id {
+    slice ds = get_data().begin_parse();
+    ds~load_msg_addr(); ;; Skip admin_address
+    ds~load_uint(8);    ;; Skip sub_admin_count
+    ds~load_ref();      ;; Skip sub_admins
+    ds~load_uint(32);   ;; Skip market_count
+    cell markets_dict = ds~load_dict();
+    (slice market_slice, int found) = udict_get?(markets_dict, 32, market_id);
+    throw_unless(102, found);
+    var market = market_slice;
+    cell question = market~load_ref();
+    int start_time = market~load_uint(32);
+    int close_time = market~load_uint(32);
+    int yes_pool = market~load_uint(64);
+    int no_pool = market~load_uint(64);
+    int outcome = market~load_uint(2);
+    return (question, start_time, close_time, yes_pool, no_pool, outcome);
+} 
